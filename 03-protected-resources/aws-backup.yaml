@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Backup Lab 3 resources: a vault with Vault Lock, a tag-based backup plan
+  and selection, a Backup Audit Manager framework with a compliance report plan,
+  and a restore-target security group in VPC A. Imports VPC A exports from
+  one-vpc.yaml. Deploy after 01-fundamentals and 02-backup-roles, in us-east-1.
+
+Parameters:
+  BackupRoleName:
+    Type: String
+    Default: service-role/AWSBackupWorkshopRole
+    Description: >
+      Path and name of the AWS Backup service role. Use the default when deployed
+      from 02-backup-roles, or AWSBackupWorkshopRole when deployed from 01-fundamentals.
+
+  BackupVaultName:
+    Type: String
+    Default: Lab3-Locked-Vault
+    Description: Name of the backup vault that receives Vault Lock.
+    AllowedPattern: '^[a-zA-Z0-9_-]{2,50}$'
+    ConstraintDescription: Use 2-50 letters, numbers, hyphens, or underscores.
+
+  VaultLockMode:
+    Type: String
+    Default: governance
+    AllowedValues:
+      - governance
+      - compliance
+    Description: >
+      governance can be removed at any time. compliance becomes immutable after the
+      ChangeableForDays cooling-off period, so choose it only if the lab requires it.
+
+  VaultLockMinRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Minimum days recovery points must be retained. Must be at most BackupRetentionDays.
+
+  VaultLockMaxRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    Description: Maximum days recovery points may be retained. Must be at least BackupRetentionDays.
+
+  VaultLockChangeableForDays:
+    Type: Number
+    Default: 3
+    MinValue: 3
+    Description: Compliance mode only. Days before the lock takes effect. AWS requires at least 3.
+
+  BackupPlanName:
+    Type: String
+    Default: Lab3-Protected-Resources-Plan
+    Description: Name of the AWS Backup plan.
+    AllowedPattern: '^[a-zA-Z0-9_-]{2,50}$'
+    ConstraintDescription: Use 2-50 letters, numbers, hyphens, or underscores.
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days each recovery point is kept by the backup plan.
+
+  BackupSelectionName:
+    Type: String
+    Default: TaggedResources
+    Description: Name of the backup selection.
+    AllowedPattern: '^[a-zA-Z0-9_-]{2,50}$'
+    ConstraintDescription: Use 2-50 letters, numbers, hyphens, or underscores.
+
+  BackupTagKey:
+    Type: String
+    Default: backup
+    Description: Resource tag key used to determine which resources are protected.
+
+  BackupTagValue:
+    Type: String
+    Default: 'true'
+    Description: Resource tag value required for selection.
+
+  AuditFrameworkName:
+    Type: String
+    Default: Lab3_Backup_Framework
+    Description: Name of the Backup Audit Manager framework. Letters, numbers, and underscores only.
+    AllowedPattern: '^[a-zA-Z][_a-zA-Z0-9]*$'
+    ConstraintDescription: Start with a letter; use only letters, numbers, and underscores.
+
+  ReportPlanName:
+    Type: String
+    Default: Lab3_Compliance_Report
+    Description: Name of the compliance report plan. Letters, numbers, and underscores only.
+    AllowedPattern: '^[a-zA-Z][_a-zA-Z0-9]*$'
+    ConstraintDescription: Start with a letter; use only letters, numbers, and underscores.
+
+  VpcACidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR of VPC A from one-vpc.yaml. Clients in this range may reach NFS on the restore target.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Use a valid IPv4 CIDR block, for example 10.0.0.0/16.
+
+Conditions:
+  IsComplianceMode: !Equals [!Ref VaultLockMode, compliance]
+
+Resources:
+  LockedBackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BackupVaultName: !Ref BackupVaultName
+      # Vault Lock blocks deleting recovery points before MinRetentionDays, so stack deletion can fail until they expire.
+      LockConfiguration:
+        MinRetentionDays: !Ref VaultLockMinRetentionDays
+        MaxRetentionDays: !Ref VaultLockMaxRetentionDays
+        ChangeableForDays: !If [IsComplianceMode, !Ref VaultLockChangeableForDays, !Ref AWS::NoValue]
+
+  ProtectedResourcesBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Ref BackupPlanName
+        BackupPlanRule:
+          - RuleName: Daily-Backup
+            TargetBackupVault: !Ref LockedBackupVault
+            ScheduleExpression: cron(0 5 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: !Ref BackupRetentionDays
+            RecoveryPointTags:
+              Environment: workshop
+
+  ProtectedResourcesSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref ProtectedResourcesBackupPlan
+      BackupSelection:
+        SelectionName: !Ref BackupSelectionName
+        IamRoleArn: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${BackupRoleName}
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: !Ref BackupTagKey
+            ConditionValue: !Ref BackupTagValue
+            
+# AWS Backup Audit Manager helps you monitor and evaluate the compliance status of your backups to meet business and 
+# regulatory requirements, and enables you to generate reports that help demonstrate compliance to auditors and regulators. 
+# In this module we will create a Framework and backup Report.
+  BackupAuditFramework:
+    Type: AWS::Backup::Framework
+    Properties:
+      FrameworkName: !Ref AuditFrameworkName
+      FrameworkDescription: Lab 3 controls for plan coverage, retention, encryption, and vault lock.
+      FrameworkControls:
+        - ControlName: BACKUP_RESOURCES_PROTECTED_BY_BACKUP_PLAN
+        - ControlName: BACKUP_RECOVERY_POINT_MINIMUM_RETENTION_CHECK
+          ControlInputParameters:
+            - ParameterName: requiredRetentionDays
+              ParameterValue: !Ref BackupRetentionDays
+        - ControlName: BACKUP_RECOVERY_POINT_ENCRYPTED
+        - ControlName: BACKUP_RESOURCES_PROTECTED_BY_BACKUP_VAULT_LOCK
+        - ControlName: BACKUP_LAST_RECOVERY_POINT_CREATED
+        - ControlName: BACKUP_PLAN_MIN_FREQUENCY_AND_MIN_RETENTION_CHECK
+          ControlInputParameters:
+            - ParameterName: requiredRetentionDays
+              ParameterValue: !Ref BackupRetentionDays
+            - ParameterName: requiredFrequencyUnit
+              ParameterValue: hours
+            - ParameterName: requiredFrequencyValue
+              ParameterValue: '24'
+
+  AuditReportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub backup-audit-reports-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ComplianceReportPlan:
+    Type: AWS::Backup::ReportPlan
+    Properties:
+      ReportPlanName: !Ref ReportPlanName
+      ReportPlanDescription: Control compliance report for the Lab 3 framework.
+      ReportDeliveryChannel:
+        S3BucketName: !Ref AuditReportBucket
+        S3KeyPrefix: lab3
+        Formats:
+          - CSV
+          - JSON
+      ReportSetting:
+        ReportTemplate: CONTROL_COMPLIANCE_REPORT
+        FrameworkArns:
+          - !GetAtt BackupAuditFramework.FrameworkArn
+        Regions:
+          - !Ref AWS::Region
+
+  RestoreTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lab 3 restore target. Allows NFS from VPC A.
+      VpcId: !ImportValue VpcAId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: !Ref VpcACidr
+      Tags:
+        - Key: Name
+          Value: Lab3-Restore-Target-SG
+
+Outputs:
+  BackupVaultArn:
+    Description: ARN of the vault with Vault Lock.
+    Value: !GetAtt LockedBackupVault.BackupVaultArn
+
+  BackupPlanId:
+    Description: ID of the Lab 3 backup plan.
+    Value: !Ref ProtectedResourcesBackupPlan
+
+  BackupPlanArn:
+    Description: ARN of the Lab 3 backup plan.
+    Value: !GetAtt ProtectedResourcesBackupPlan.BackupPlanArn
+
+  BackupAuditFrameworkArn:
+    Description: ARN of the Backup Audit Manager framework.
+    Value: !GetAtt BackupAuditFramework.FrameworkArn
+
+  ComplianceReportPlanArn:
+    Description: ARN of the compliance report plan.
+    Value: !GetAtt ComplianceReportPlan.ReportPlanArn
+
+  AuditReportBucketName:
+    Description: S3 bucket that receives compliance reports.
+    Value: !Ref AuditReportBucket
+
+  RestoreTargetSecurityGroupId:
+    Description: Security group for restored EFS mount targets in VPC A.
+    Value: !Ref RestoreTargetSecurityGroup

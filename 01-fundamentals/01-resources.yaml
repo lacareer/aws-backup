@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "standing up resourcers for the aws workshop for AWS-backup"
+Parameters:
+  EC2Name:
+    Type: String
+    Default: lab1-EC2
+    Description: Name of the EC2 instance.
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: 'The ID of the AMI.'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64    
+
+Resources:
+##--------------------------------------
+# RDS
+#---------------------------------------
+  CustomKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Aws Backup custom CMK
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - Action: kms:*
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:'
+                  - !Ref AWS::Partition
+                  - ':iam::'
+                  - !Ref AWS::AccountId
+                  - ':root'
+            Resource: '*'
+          - Action:
+              - kms:CreateGrant
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Condition:
+              StringEquals:
+                kms:ViaService: !Join
+                  - ''
+                  - - secretsmanager.
+                    - !Ref AWS::Region
+                    - .amazonaws.com
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - 'arn:'
+                  - !Ref AWS::Partition
+                  - ':iam::'
+                  - !Ref AWS::AccountId
+                  - ':root'
+            Resource: '*'
+        Version: '2012-10-17'
+      PendingWindowInDays: 7
+      Tags:
+        - Key: Name
+          Value: AwsBackupCustomKMSKey
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  CustomKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/aws-backup-cmk
+      TargetKeyId: !GetAtt CustomKMSKey.Arn
+  
+  CatalogEcsExpressTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: catalogEcsTaskRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CatalogEcsExpressTaskRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:PutRetentionPolicy
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/express/*            
+              - Sid: SessionIntoEcsExpressCatalogTask
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: catalogEcsTaskRole
+
+  CatalogEcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: catalogEcsTaskExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CatalogEcsTaskExecutionRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - secretsmanager:GetSecretValue
+                  - ssm:GetParameters
+                Resource: 
+                  - !GetAtt CustomKMSKey.Arn
+                  - !Join
+                    - ''
+                    - - 'arn:'
+                      - !Ref AWS::Partition
+                      - ':ssm:'
+                      - !Ref AWS::Region
+                      - ':'
+                      - !Ref AWS::AccountId
+                      - ':parameter'
+                      - !Ref CatalogMySQLDBEndpointParameter
+                  - !Ref CatalogDBCredentialsSecret
+      Tags:
+        - Key: Name
+          Value: catalogEcsTaskExecutionRole
+
+  CatalogDBCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        ExcludePunctuation: true
+        GenerateStringKey: password
+        IncludeSpace: false
+        PasswordLength: 10
+        SecretStringTemplate: '{"username":"root"}'
+      KmsKeyId: !GetAtt CustomKMSKey.Arn
+      Name: lab1-rds
+      Tags:
+        - Key: Name
+          Value: lab1-rds
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  CatalogMySQLDBEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /retail-store-ecs/catalog/db-endpoint-mysql
+      Tags:
+        CreationDate: '2026-09-04'
+        Version: 1.0.14
+      Type: String
+      Value: !Join
+        - ':'
+        - - !GetAtt CatalogMySqlDBCluster.Endpoint.Address
+          - !GetAtt CatalogMySqlDBCluster.Endpoint.Port
+
+  CatalogMySqlDBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      CopyTagsToSnapshot: true
+      DBClusterIdentifier: lab1-rds
+      DBClusterParameterGroupName: !Ref CatalogDBClusterParams
+      DBSubnetGroupName: !Ref CatalogDBClusterSubnets
+      DatabaseName: catalog
+      DeletionProtection: false
+      Engine: aurora-mysql
+      EngineVersion: 8.4.mysql_aurora.8.4.7
+      MasterUserPassword: !Join
+        - ''
+        - - '{{resolve:secretsmanager:'
+          - !Ref CatalogDBCredentialsSecret
+          - ':SecretString:password::}}'
+      MasterUsername: !Join
+        - ''
+        - - '{{resolve:secretsmanager:'
+          - !Ref CatalogDBCredentialsSecret
+          - ':SecretString:username::}}'
+      ServerlessV2ScalingConfiguration:
+        MaxCapacity: 2
+        MinCapacity: 0.5
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: catalog
+      VpcSecurityGroupIds:
+        - !GetAtt CatalogRDSSecurityGroup.GroupId
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  CatalogDBCredentialsSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref CatalogDBCredentialsSecret
+      TargetId: !Ref CatalogMySqlDBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  CatalogClusterMySqlInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref CatalogMySqlDBCluster
+      ## Workshop uses aurora serverless but Pluralsight SCP prevents using db.serverless class directly
+      # DBInstanceClass: db.serverless
+      DBInstanceClass: db.t4g.medium
+      Engine: aurora-mysql
+      PromotionTier: 0
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: 'mysql-lab1-rds'
+        - Key: mysql-lab1-rds
+          Value: lab1-rds
+        - Key: backup
+          Value: 'true'          
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+   
+  CatalogRDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Catalog RDS instance
+      GroupName: lab1-rds-mysql-sg
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - Description: Allow MySQL access
+          FromPort: 3306
+          IpProtocol: tcp
+          SourceSecurityGroupId: !GetAtt CatalogSecurityGroupIngress.GroupId
+          ToPort: 3306
+      Tags:
+        - Key: Name
+          Value: lab1-rds-mysql-sg
+      VpcId: !ImportValue VpcAId
+
+
+  CatalogSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for ECS Catalog Task
+      GroupName: lab1-rds-sg
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0 #can tighten to vpc cidr for better security
+          Description: Allow inbound 8080 traffic
+          FromPort: 8080
+          IpProtocol: tcp
+          ToPort: 8080
+      Tags:
+        - Key: Name
+          Value: lab1-rds-sg
+      VpcId: !ImportValue VpcAId
+
+  CatalogDBClusterParams:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: Cluster parameter group for aurora-mysql8.4
+      Family: aurora-mysql8.4
+      Parameters:
+        require_secure_transport: 'OFF'
+      Tags:
+        - Key: Name
+          Value: catalog-mysqlrds-parameter-group
+
+  CatalogDBClusterSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for CatalogCluster database
+      SubnetIds:
+        - !ImportValue VpcAPrivateSubnetAZ1
+        - !ImportValue VpcAPrivateSubnetAZ2
+        - !ImportValue VpcAPrivateSubnetAZ3
+      Tags:
+        - Key: Name
+          Value: catalog-mysqlrds-subnet-group
+
+##--------------------------------------
+# DDB
+#---------------------------------------
+  CartsSecurityDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: idx_global_customerId
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TableName: lab1-ddb
+      Tags:
+        - Key: Name
+          Value: lab1-ddb
+        - Key: backup
+          Value: 'true'         
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+##--------------------------------------
+# EFS
+#---------------------------------------
+  UiManagedInstanceTaskSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the ui-facing ECS Managed Instances tasks.
+      GroupName: ui-retail-store-ecs-sg
+      VpcId: !ImportValue VpcAId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0 ## just for lab purposes as this should be restricted to alb sg  security group(as shown below) or vpc cidr range
+          ##SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  UiEfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the UI EFS file system.
+      GroupName: retail-store-ui-efs-sg
+      VpcId: !ImportValue VpcAId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref UiManagedInstanceTaskSg
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  UiEfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: lab1-efs
+        - Key: backup
+          Value: 'true'
+          
+
+  # One mount target per AZ the UI tasks run in
+  # Note: your UiService only uses VpcAPrivateSubnetAZ1/AZ2/AZ3, so three mount targets cover every subnet a UI task can land on. 
+  # A mount target must exist in each subnet where a task runs, otherwise the mount fails.  
+  UiEfsMountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref UiEfsFileSystem
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ1
+      SecurityGroups:
+        - !Ref UiEfsSecurityGroup
+
+  UiEfsMountTargetAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref UiEfsFileSystem
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ2
+      SecurityGroups:
+        - !Ref UiEfsSecurityGroup
+
+  UiEfsMountTargetAZ3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref UiEfsFileSystem
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ3
+      SecurityGroups:
+        - !Ref UiEfsSecurityGroup  
+
+##--------------------------------------
+# EC2
+#---------------------------------------    
+  UiEc2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  UiEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref UiEc2InstanceRole
+
+  UiEc2Instance:
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref UiEc2InstanceProfile
+      InstanceType: t2.micro
+      SecurityGroupIds:
+        - !Ref UiManagedInstanceTaskSg
+      SubnetId: !ImportValue VpcAPublicSubnetAZ1
+      ImageId: !Ref AMI
+      Tags:
+        - Key: Name
+          Value: lab1-ec2
+        - Key: backup
+          Value: 'true'
+      UserData:
+        Fn::Base64: !Sub |
+          sudo amazon-linux-extras install -y nginx1
+          sudo service nginx start
+          sudo rm /usr/share/nginx/html/index.html
+          sudo cat > /usr/share/nginx/html/index.html << 'WEBSITE'
+          <html>
+          <head>
+              <title>Taco Team Server </title>
+          </head>
+          <body style="background-color:#1F778D">
+              <p style="text-align: center;">
+                  <span style="color:#FFFFFF;">
+                      <span style="font-size:100px;">Welcome to the Taco Team website! Have a &#127790;</span>
+                  </span>
+              </p>
+          </body>
+          </html>
+          WEBSITE  
+
+# add     
+
+##--------------------------------------
+# S3
+#---------------------------------------  
+  UiS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: lab1-s3-okc-bucket
+      VersioningConfiguration:
+        Status: Enabled # versioning needs to be enabled for aws backup
+      Tags:
+        - Key: Name
+          Value: lab1-s3
+        - Key: backup
+          Value: 'true'

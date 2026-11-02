@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Backup Lab 4 resources: AWS Config recording with a delivery channel and
+  S3 bucket, plus a Backup Audit Manager governance framework. Config resource
+  tracking lets the framework evaluate resources. Deploy in us-east-1 after the
+  earlier labs.
+
+Parameters:
+  CreateConfigServiceLinkedRole:
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Description: >
+      Set to No if the account already has the AWSServiceRoleForConfig service-linked
+      role, or the stack fails with a duplicate role error.
+
+  ConfigSnapshotFrequency:
+    Type: String
+    Default: TwentyFour_Hours
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+    Description: How often AWS Config delivers configuration snapshots.
+
+  FrameworkName:
+    Type: String
+    Default: Lab4_Governance_Framework
+    Description: Name of the Backup Audit Manager framework. Letters, numbers, and underscores only.
+    AllowedPattern: '^[a-zA-Z][_a-zA-Z0-9]*$'
+    ConstraintDescription: Start with a letter; use only letters, numbers, and underscores.
+
+  RequiredFrequencyDays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 31
+    Description: Minimum backup frequency in days that a backup plan must meet.
+
+  RequiredRetentionDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    Description: Minimum retention in days that backup plans and recovery points must meet.
+
+Conditions:
+  CreateConfigRole: !Equals [!Ref CreateConfigServiceLinkedRole, 'Yes']
+
+Resources:
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete # Retained on stack deletion so AWS Config history survives. Empty and delete it manually.
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${ConfigBucket}
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+            Action: s3:PutObject
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${ConfigBucket}/AWSLogs/${AWS::AccountId}/*
+          - Sid: AWSConfigBucketSecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - s3:*
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${ConfigBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${ConfigBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ConfigServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    Condition: CreateConfigRole
+    Properties:
+      AWSServiceName: config.amazonaws.com
+      Description: Service-linked role for AWS Config
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    DependsOn:
+      - ConfigBucketPolicy
+    Properties:
+      RoleARN: !If
+        - CreateConfigRole
+        - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/config.amazonaws.com/${ConfigServiceLinkedRole.RoleName}
+        - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn:
+      - ConfigBucketPolicy
+      - ConfigRecorder
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref ConfigSnapshotFrequency
+      S3BucketName: !Ref ConfigBucket
+
+  BackupGovernanceFramework:
+    Type: AWS::Backup::Framework
+    DependsOn:
+      - ConfigRecorder
+      - ConfigDeliveryChannel
+    Properties:
+      FrameworkName: !Ref FrameworkName
+      FrameworkDescription: Governance controls for backup coverage, retention, and encryption.
+      FrameworkControls:
+        - ControlName: BACKUP_RESOURCES_PROTECTED_BY_BACKUP_PLAN
+        - ControlName: BACKUP_PLAN_MIN_FREQUENCY_AND_MIN_RETENTION_CHECK
+          ControlInputParameters:
+            - ParameterName: requiredFrequencyUnit
+              ParameterValue: days
+            - ParameterName: requiredFrequencyValue
+              ParameterValue: !Ref RequiredFrequencyDays
+            - ParameterName: requiredRetentionDays
+              ParameterValue: !Ref RequiredRetentionDays
+        - ControlName: BACKUP_RECOVERY_POINT_MINIMUM_RETENTION_CHECK
+          ControlInputParameters:
+            - ParameterName: requiredRetentionDays
+              ParameterValue: !Ref RequiredRetentionDays
+        - ControlName: BACKUP_RECOVERY_POINT_ENCRYPTED
+        - ControlName: BACKUP_LAST_RECOVERY_POINT_CREATED
+
+Outputs:
+  ConfigBucketName:
+    Description: S3 bucket that receives AWS Config snapshots and history.
+    Value: !Ref ConfigBucket
+
+  ConfigRecorderName:
+    Description: Name of the AWS Config configuration recorder.
+    Value: !Ref ConfigRecorder
+
+  ConfigDeliveryChannelName:
+    Description: Name of the AWS Config delivery channel.
+    Value: !Ref ConfigDeliveryChannel
+
+  BackupGovernanceFrameworkArn:
+    Description: ARN of the Backup Audit Manager governance framework.
+    Value: !GetAtt BackupGovernanceFramework.FrameworkArn

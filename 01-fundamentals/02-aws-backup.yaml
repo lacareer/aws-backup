@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Creates the Lab1-Vault backup vault from the AWS Backup Immersion Day
+  console walkthrough. Deploy in us-east-1 to match the workshop.
+
+Parameters:
+  BackupVaultName:
+    Type: String
+    Default: My-AWS-Backup-Vault
+    Description: Name of the AWS Backup vault.
+    AllowedPattern: '^[a-zA-Z0-9_-]{2,50}$'
+    ConstraintDescription: Use 2-50 letters, numbers, hyphens, or underscores.
+
+  BackupPlanName:
+    Type: String
+    Default: Workshop-Backup-Plan
+    Description: Name of the AWS Backup plan.
+    AllowedPattern: '^[a-zA-Z0-9_-]{2,50}$'
+    ConstraintDescription: Use 2-50 letters, numbers, hyphens, or underscores.
+
+  BackupSelectionName:
+    Type: String
+    Default: TaggedResources
+    Description: Name of the backup selection.
+    AllowedPattern: '^[a-zA-Z0-9_-]{2,50}$'
+    ConstraintDescription: Use 2-50 letters, numbers, hyphens, or underscores.
+
+  BackupTagKey:
+    Type: String
+    Default: backup
+    Description: Resource tag key used to determine which resources are protected.
+
+  BackupTagValue:
+    Type: String
+    Default: 'true'
+    Description: Resource tag value required for selection.
+
+
+# Service opt-in and advanced DynamoDB backup settings are account/Region
+# settings, not native CloudFormation resources. Enable them separately in
+# AWS Backup settings before creating a backup plan or resource selection.
+Resources:
+  MyBackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Delete ## should be 'Retain' production
+    UpdateReplacePolicy: Delete ## should be 'Retain' production
+    Properties:
+      BackupVaultName: !Ref BackupVaultName
+      # Omitting EncryptionKeyArn uses the AWS Backup default encryption key,
+      # matching the console walkthrough's default Encryption key selection.
+
+  ## Add Iam role to be used for backing up and restoring ec2, rds, efs, s3 and other resources
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSBackupWorkshopRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore  
+      Policies:
+        - PolicyName: PassEc2InstanceRoleOnRestore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/res-UiEc2InstanceRole-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com              
+
+  MyBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Ref BackupPlanName
+        BackupPlanRule:
+          - RuleName: Daily-Backup
+            TargetBackupVault: !Ref MyBackupVault
+            ScheduleExpression: cron(0 5 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 120
+            EnableContinuousBackup: false
+            Lifecycle:
+              MoveToColdStorageAfterDays: 90
+              DeleteAfterDays: 180
+            RecoveryPointTags:
+              Environment: workshop
+              BackupPlan: !Ref BackupPlanName
+
+  MyBackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref MyBackupPlan
+      BackupSelection:
+        SelectionName: !Ref BackupSelectionName
+        IamRoleArn: !GetAtt BackupRole.Arn
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: !Ref BackupTagKey
+            ConditionValue: !Ref BackupTagValue
+
+Outputs:
+  BackupVaultName:
+    Description: Name of the created AWS Backup vault.
+    Value: !Ref MyBackupVault
+  BackupVaultArn:
+    Description: ARN of the created AWS Backup vault.
+    Value: !GetAtt MyBackupVault.BackupVaultArn

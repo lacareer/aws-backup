@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Backup Lab 2 resources: IAM roles, EBS and EFS encryption examples,
+  backup vaults, and a recovery-point deletion deny policy.
+
+Parameters:
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for the standalone EBS volumes.
+
+  CreateUnencryptedEbsVolume:
+    Type: String
+    Default: 'yes'
+    AllowedValues:
+      - 'yes'
+      - 'no'
+    Description: >
+      Set to no if account-level EBS encryption prevents creating an
+      unencrypted volume.
+
+  # EfsClientSecurityGroupId:
+  #   Type: AWS::EC2::SecurityGroup::Id
+  #   Description: Client security group allowed to connect to EFS over NFS.
+
+Conditions:
+  CreateUnencryptedVolume: !Equals [!Ref CreateUnencryptedEbsVolume, 'yes']
+
+Resources:
+  BackupAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MyAWSBackupAdminRole
+      Description: Administrator access to AWS Backup.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSBackupFullAccess
+
+  BackupOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MyAWSBackupOperatorRole
+      Description: Backup and restore operations without policy administration.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSBackupOperatorAccess
+
+  BackupAuditorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MyAWSBackupAuditorRole
+      Description: Read-only access to AWS Backup for auditing.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSBackupAuditAccess
+
+  BackupWorkshopRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSBackupWorkshopRole
+      Description: Service role for AWS Backup backup and restore operations.
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        #resource policy for restore operations
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores 
+
+  WorkshopCustomerManagedKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer-managed key for the lab EBS, EFS, and backup-vault examples.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  WorkshopCustomerManagedKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/aws-backup-lab-cmk
+      TargetKeyId: !Ref WorkshopCustomerManagedKey
+
+##-----------------------------------
+# PluralSight blocks creation of EBS
+##-----------------------------------
+  UnencryptedEbsVolume:
+    Type: AWS::EC2::Volume
+    Condition: CreateUnencryptedVolume
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: false
+      Size: 10
+      VolumeType: gp2
+      Tags:
+        - Key: Name
+          Value: Lab2-Unencrypted-Volume
+
+  DefaultEncryptedEbsVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: true
+      Size: 10
+      VolumeType: gp2
+      Tags:
+        - Key: Name
+          Value: Lab2-Encrypted-Volume
+
+  CustomerManagedEncryptedEbsVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: true
+      KmsKeyId: !GetAtt WorkshopCustomerManagedKey.Arn
+      Size: 10
+      VolumeType: gp2
+      Tags:
+        - Key: Name
+          Value: Lab2-CMK-Encrypted-Volume
+
+##-----------------------------------
+
+  EfsMountTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from the designated EFS clients.
+      VpcId: !ImportValue VpcAId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 0.0.0.0/0 # Should be restricted in production
+          # SourceSecurityGroupId: !Ref EfsClientSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: Lab2-EFS-Mount-Target-SG
+
+  DefaultEncryptedEfs:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+        - Key: Name
+          Value: Lab2-EFS
+
+  CustomerManagedEncryptedEfs:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      KmsKeyId: !GetAtt WorkshopCustomerManagedKey.Arn
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+        - Key: Name
+          Value: Lab2-EFS-CMK
+
+  DefaultEncryptedEfsMountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DefaultEncryptedEfs
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ1
+      SecurityGroups:
+        - !GetAtt EfsMountTargetSecurityGroup.GroupId
+
+  DefaultEncryptedEfsMountTargetAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DefaultEncryptedEfs
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ2
+      SecurityGroups:
+        - !GetAtt EfsMountTargetSecurityGroup.GroupId
+
+  DefaultEncryptedEfsMountTargetAZ3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DefaultEncryptedEfs
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ3
+      SecurityGroups:
+        - !GetAtt EfsMountTargetSecurityGroup.GroupId
+
+  CustomerManagedEncryptedEfsMountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CustomerManagedEncryptedEfs
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ1
+      SecurityGroups:
+        - !GetAtt EfsMountTargetSecurityGroup.GroupId
+
+  CustomerManagedEncryptedEfsMountTargetAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CustomerManagedEncryptedEfs
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ2
+      SecurityGroups:
+        - !GetAtt EfsMountTargetSecurityGroup.GroupId
+
+  CustomerManagedEncryptedEfsMountTargetAZ3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref CustomerManagedEncryptedEfs
+      SubnetId: !ImportValue VpcAPrivateSubnetAZ3
+      SecurityGroups:
+        - !GetAtt EfsMountTargetSecurityGroup.GroupId
+
+  DefaultEncryptionBackupVault:
+    DeletionPolicy: Delete ## should be 'Retain' production
+    UpdateReplacePolicy: Delete ## should be 'Retain' production  
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: my-backup-vault
+      AccessPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyRootRecoveryPointDeletion
+            Effect: Deny
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action:
+              - backup:UpdateRecoveryPointLifecycle
+              - backup:DeleteRecoveryPoint
+            Resource:
+              - !Sub arn:${AWS::Partition}:backup:${AWS::Region}:${AWS::AccountId}:recovery-point:*
+              - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*
+              - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}::image/*
+              - !Sub arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:awsbackup:*
+              - !Sub arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster-snapshot:awsbackup:*
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*
+
+  CustomerManagedEncryptionBackupVault:
+    DeletionPolicy: Delete ## should be 'Retain' production
+    UpdateReplacePolicy: Delete ## should be 'Retain' production   
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: my-backup-vault-cmk
+      EncryptionKeyArn: !GetAtt WorkshopCustomerManagedKey.Arn
+
+Outputs:
+  BackupAdminRoleArn:
+    Description: ARN of the AWS Backup administrator role.
+    Value: !GetAtt BackupAdminRole.Arn
+
+  BackupOperatorRoleArn:
+    Description: ARN of the AWS Backup operator role.
+    Value: !GetAtt BackupOperatorRole.Arn
+
+  BackupAuditorRoleArn:
+    Description: ARN of the AWS Backup auditor role.
+    Value: !GetAtt BackupAuditorRole.Arn
+
+  BackupWorkshopRoleArn:
+    Description: ARN of the AWS Backup service role used by the workshop.
+    Value: !GetAtt BackupWorkshopRole.Arn
+
+  WorkshopCustomerManagedKeyArn:
+    Description: Customer-managed KMS key ARN.
+    Value: !GetAtt WorkshopCustomerManagedKey.Arn
+
+  DefaultEncryptedEfsId:
+    Description: EFS file system encrypted with the AWS-managed key.
+    Value: !Ref DefaultEncryptedEfs
+
+  CustomerManagedEncryptedEfsId:
+    Description: EFS file system encrypted with the customer-managed key.
+    Value: !Ref CustomerManagedEncryptedEfs
+
+  DefaultEncryptionBackupVaultArn:
+    Description: Backup vault using AWS Backup's default encryption key.
+    Value: !GetAtt DefaultEncryptionBackupVault.BackupVaultArn
+
+  CustomerManagedEncryptionBackupVaultArn:
+    Description: Backup vault using the customer-managed KMS key.
+    Value: !GetAtt CustomerManagedEncryptionBackupVault.BackupVaultArn
